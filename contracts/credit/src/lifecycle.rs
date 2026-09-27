@@ -110,7 +110,7 @@ use crate::events::{
 use crate::risk::{MAX_INTEREST_RATE_BPS, MAX_RISK_SCORE};
 use crate::storage::{
     add_treasury_balance as storage_add_treasury_balance,
-    assert_not_paused, assert_ts_monotonic, bump_credit_line_ttl,
+    assert_not_paused, assert_ts_monotonic,
     clear_repayment_schedule, get_credit_line,
     get_late_fee_flat as storage_get_late_fee_flat,
     get_repayment_schedule, persist_credit_line,
@@ -347,6 +347,13 @@ fn suspend_credit_line_internal(env: &Env, borrower: Address, target: CreditStat
 /// # Panics
 /// - `ContractError::CreditLineNotFound` if no credit line exists for `borrower`.
 /// - `ContractError::CreditLineClosed` if the credit line is `Closed`.
+///
+/// # Storage
+/// Loads the credit line via [`crate::storage::get_credit_line`], which bumps
+/// the entry's persistent TTL on read. The bump therefore happens even when
+/// the admin clears the grace period (`0`) or the `Closed` guard reverts, so
+/// this admin-only path can never be the interaction that lets an active
+/// borrower's entry drift toward archival.
 pub fn set_per_borrower_liquidation_grace(
     env: &Env,
     borrower: Address,
@@ -355,10 +362,7 @@ pub fn set_per_borrower_liquidation_grace(
     assert_not_paused(env);
     require_admin_auth(env);
 
-    let stored_line: CreditLineData = env
-        .storage()
-        .persistent()
-        .get(&borrower)
+    let stored_line: CreditLineData = get_credit_line(env, &borrower)
         .unwrap_or_else(|| env.panic_with_error(ContractError::CreditLineNotFound));
 
     if stored_line.status == CreditStatus::Closed {
@@ -854,10 +858,7 @@ pub fn close_credit_lines_batch(env: Env, borrowers: Vec<Address>) {
 pub fn default_credit_line(env: Env, borrower: Address) {
     assert_not_paused(&env);
     // Admin auth enforced by the `lib.rs` wrapper (see `suspend_credit_line`).
-    let stored_line: CreditLineData = env
-        .storage()
-        .persistent()
-        .get(&borrower)
+    let stored_line: CreditLineData = get_credit_line(&env, &borrower)
         .unwrap_or_else(|| env.panic_with_error(ContractError::CreditLineNotFound));
     let previous_utilized = stored_line.utilized_amount;
 
@@ -943,18 +944,25 @@ pub fn default_credit_line(env: Env, borrower: Address) {
 /// Reduces `accrued_interest` first, then `utilized_amount`, by `amount`
 /// (clamped to the outstanding balance). No token movement occurs — this is
 /// pure accounting relief, e.g. for negotiated settlements handled off-chain.
+///
+/// # Authorization
+/// Admin only. Enforced by the `lib.rs` wrapper (`require_admin_auth`); not
+/// re-checked here because a second `require_auth` for the already-authorized
+/// admin address within one invocation is rejected by the Soroban auth frame as
+/// `Error(Auth, ExistingValue)` (same convention as `suspend_credit_line`).
+///
+/// # Storage
+/// Loads the credit line via [`crate::storage::get_credit_line`], which bumps
+/// the entry's persistent TTL on read, before any mutation of the debt
+/// buckets.
 pub fn forgive_debt(env: Env, borrower: Address, amount: i128) {
     assert_not_paused(&env);
-    require_admin_auth(&env);
 
     if amount <= 0 {
         env.panic_with_error(ContractError::InvalidAmount);
     }
 
-    let stored_line: CreditLineData = env
-        .storage()
-        .persistent()
-        .get(&borrower)
+    let stored_line: CreditLineData = get_credit_line(&env, &borrower)
         .unwrap_or_else(|| env.panic_with_error(ContractError::CreditLineNotFound));
     let previous_utilized = stored_line.utilized_amount;
     let previous_status = stored_line.status;
@@ -1282,6 +1290,12 @@ pub fn reinstate_credit_line(env: Env, borrower: Address, target_status: CreditS
 /// # Authorization
 /// Requires admin authorization because the schedule controls delinquency and
 /// due-date state for the borrower.
+///
+/// # Storage
+/// The existence check reads through [`crate::storage::get_credit_line`], so
+/// the credit-line entry's persistent TTL is bumped on read; the schedule
+/// entry itself is bumped by
+/// [`crate::storage::set_repayment_schedule`] on write.
 pub fn set_repayment_schedule(
     env: &Env,
     borrower: Address,
@@ -1296,7 +1310,7 @@ pub fn set_repayment_schedule(
         env.panic_with_error(ContractError::InvalidAmount);
     }
 
-    if !env.storage().persistent().has(&borrower) {
+    if get_credit_line(env, &borrower).is_none() {
         env.panic_with_error(ContractError::CreditLineNotFound);
     }
 
@@ -1306,10 +1320,9 @@ pub fn set_repayment_schedule(
         next_due_ts: first_due_ts,
     };
     storage_set_repayment_schedule(env, &borrower, &schedule);
-    // Setting a schedule is an interaction with the credit line, so keep the
-    // credit-line entry live as well (the schedule entry is bumped by the
-    // storage setter itself).
-    bump_credit_line_ttl(env, &borrower);
+    // The credit-line entry is bumped by `get_credit_line` above and the
+    // schedule entry is bumped by the storage setter itself, so this path
+    // refreshes every persistent key it touches.
 }
 
 /// Advance a borrower's installment schedule after a repayment.
